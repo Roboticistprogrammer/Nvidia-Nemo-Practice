@@ -58,74 +58,60 @@ graph LR
 
 This architecture shows how the user query is processed through both the Milvus Vector DB for traditional retrieval and the Knowledge Graph with cuGraph for multi-hop search. The results from both are then used to augment the prompt sent to the NVIDIA AI Playground backend.
 
-## Setup Steps
+## Authentication: bring your own key
 
-Follow these steps to get the chatbot up and running in less than 5 minutes:
+There is no shared API key. Each user pastes their own NVIDIA API key (free at [build.nvidia.com](https://build.nvidia.com)) into the sidebar:
 
-### 1. Clone this repository to a Linux machine
+- The backend verifies the key with NVIDIA once (then caches the result) and uses it for all of that user's LLM calls, so usage is billed to the user's own account.
+- The key is kept only in the browser session (Streamlit session state) and sent to the backend in the `X-NVIDIA-API-Key` header. It is never written to disk or logged.
+- Each key maps to a private **workspace** (`HMAC(WORKSPACE_SECRET, key)`) holding the user's uploads, generated CSVs, the knowledge graph and a dedicated Milvus collection. The same key reopens the same workspace later.
 
-```bash
-git clone https://github.com/NVIDIA/GenerativeAIExamples/ && cd GenerativeAIExamples/community/knowledge_graph_rag
-```
+For local development you can set `ALLOW_SERVER_KEY=true` and `NVIDIA_API_KEY` in `.env` so the UI works without entering a key. Never enable this on a public deployment.
 
-### 2. Get an NVIDIA AI Playground API Key
+## Run locally (development)
 
-```bash
-export NVIDIA_API_KEY="nvapi-*******************"
-```
-
-If you don't have an API key, follow [these instructions](https://github.com/NVIDIA/GenerativeAIExamples/blob/main/docs/api-catalog.md#get-an-api-key-for-the-accessing-models-on-the-api-catalog) to sign up for an NVIDIA AI Foundation developer account and obtain access.
-
-### 3. Create a Python virtual environment and activate it
-
-Refer to the .env.example include the data directory to point to data folder you create inside the backend folder: backend/data. Also set the backend URL.
-
-### 4. Create a Python virtual environment and activate it
+Requires Python 3.10 and Docker (for Milvus).
 
 ```bash
 cd knowledge_graph_rag
-pip install virtualenv
-python3 -m virtualenv venv
-source venv/bin/activate
+cp .env.example .env          # then set WORKSPACE_SECRET
+uv venv --python 3.10 .venv && source .venv/bin/activate
+uv pip install -r requirements.txt
+
+docker compose up -d standalone   # Milvus (+ etcd, MinIO) on localhost:19530
+
+cd backend && python server.py    # API on http://localhost:8000 (docs at /docs)
+# in another terminal
+cd frontend && streamlit run ui.py
 ```
 
-### 5. Install the required packages
+Open http://localhost:8501, enter your API key in the sidebar, upload PDFs and click **Process Documents**. Only text from PDFs is supported. It can be extended to other file formats with the Unstructured.io loader in LangChain.
+
+## Deploy
+
+The whole stack runs from `docker-compose.yaml` on a single machine: Milvus, the FastAPI backend, the Streamlit frontend and an optional Caddy HTTPS proxy. No GPU is needed because the LLMs are NVIDIA-hosted and the BGE-M3 embeddings run on CPU. Plan for **8 GB RAM minimum (16 GB recommended)**; e.g. a Hetzner CPX31/CX42 VPS.
 
 ```bash
-pip install -r requirements.txt
+cp .env.example .env
+# set WORKSPACE_SECRET (python -c "import secrets; print(secrets.token_hex(32))")
+# set DOMAIN=kg.example.com and point its DNS A record at the server
+
+docker compose --profile https up -d --build
 ```
 
-### 6. Setup a hosted Milvus vector database
+- **HTTPS:** Caddy serves the UI at `https://$DOMAIN` with automatic Let's Encrypt certificates (ports 80/443 must be open). Without the `https` profile, the UI is only bound to `127.0.0.1:8501`. Set `FRONTEND_BIND=0.0.0.0` to expose it directly over plain HTTP.
+- **Internal only:** the backend has no published port; only the frontend can reach it. Milvus and MinIO are bound to localhost.
+- **Data:** workspaces live in the `app-data` volume, Milvus in `./volumes/`, and model weights in `hf-cache`. The first document processing or chat downloads BGE-M3 and the reranker (~2.5 GB) once.
+- **Models:** NVIDIA retires hosted models regularly. If requests fail with 404/410, update `LLM_MODELS` / `EVAL_EMBED_MODEL` in `.env` from [build.nvidia.com/models](https://build.nvidia.com/models) and `docker compose up -d`.
+- **Managed Milvus:** to use Zilliz Cloud instead of the bundled Milvus, set `MILVUS_URI` and `MILVUS_TOKEN` in `.env` and remove the `MILVUS_URI` override and the `standalone` dependency from the `backend` service.
 
-Follow the instructions [here](https://milvus.io/docs/install_standalone-docker.md) to deploy a hosted Milvus instance for the vector database backend. Note that it must be Milvus 2.4 or better to support [hybrid search](https://milvus.io/docs/multi-vector-search.md). We do not support disabling this feature for previous versions of Milvus as of now.
-
-### 7. Launch the Streamlit frontend and FAST API backend
-
-```bash
-cd knowledge_graph_rag
-cd backend
-python server.py
-
-```
-In another terminal,
-```bash
-cd knowledge_graph_rag
-cd frontend
-streamlit run ui.py
-
-```
-
-Open the URL in your browser to access the UI and chatbot!
-
-### 8. Upload Docs and Train Model
-
-Upload your own documents to a folder, or use an existing folder for the knowledge graph creation. Note that the implementation currently focuses on text from PDFs only. It can be extended to other text file formats using the Unstructured.io data loader in LangChain.
+Known limits: there is no per-user rate limiting, and each backend process holds the embedding models in memory (~3–4 GB), so run a single backend container.
 
 ## Pipeline Components
 
 1. **Data Ingestion**:
    - ArXiv paper downloader
-   - Arbitrary document folder ingestion
+   - PDF upload into a private per-user workspace
 2. **Knowledge Graph Creation**:
    - Uses the API Catalog models through the LangChain NVIDIA AI Endpoints interface
 3. **Graph Representation**: cuGraph + RAPIDS + NetworkX
