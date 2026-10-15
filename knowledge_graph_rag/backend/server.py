@@ -13,16 +13,35 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-import subprocess
-from fastapi import FastAPI
-from routers import ui_backend,chat,evaluation,visualization
 import logging
+import os
 
-app = FastAPI()
+import config  # loads .env before anything reads the environment
+from fastapi import FastAPI, Request
+from fastapi.responses import JSONResponse
+from routers import auth, documents, ui_backend, chat, evaluation, visualization
+
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
+app = FastAPI(title="Knowledge Graph RAG")
+
+
+@app.exception_handler(Exception)
+async def unhandled_error(request: Request, exc: Exception):
+    # Surface upstream errors (e.g. a retired NVIDIA model) to the UI instead of a bare 500
+    logger.exception(f"Unhandled error on {request.url.path}")
+    return JSONResponse(status_code=500, content={"detail": f"{type(exc).__name__}: {exc}"})
+
+
+@app.get("/health")
+def health():
+    return {"status": "ok"}
+
+
 # Include routers from different modules
+app.include_router(auth.router, prefix="/auth", tags=["auth"])
+app.include_router(documents.router, prefix="/documents", tags=["documents"])
 app.include_router(ui_backend.router, prefix="/ui")
 app.include_router(chat.router, prefix="/chat")
 app.include_router(evaluation.router, prefix="/evaluation")
@@ -31,4 +50,4 @@ app.include_router(visualization.router, prefix="/visualization", tags=["visuali
 
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run(app, host="0.0.0.0", port=8000)
+    uvicorn.run(app, host=os.getenv("HOST", "127.0.0.1"), port=int(os.getenv("PORT", "8000")))
