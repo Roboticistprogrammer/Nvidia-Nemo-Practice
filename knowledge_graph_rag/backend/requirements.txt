@@ -1,0 +1,25 @@
+# Backend (FastAPI) dependencies. In Docker, torch is installed CPU-only first (see Dockerfile).
+arxiv==2.1.0
+datasets==2.19.1
+fastapi==0.143.1
+# BGE-M3 embeddings + reranker; pymilvus[model] needs it but doesn't install it
+FlagEmbedding==1.4.2
+langchain==0.2.6
+langchain_community==0.2.6
+langchain_core==0.2.10
+# 0.1.x only knows a mid-2024 model table whose models NVIDIA has since retired
+langchain-nvidia-ai-endpoints==0.2.0
+networkx==3.2.1
+numpy==1.24.1
+openai==1.109.1
+pandas==2.2.2
+pymilvus[model]==2.4.3
+python-dotenv==1.2.4
+python-multipart==0.0.32
+ragas==0.1.10
+Requests==2.31.0
+# pymilvus 2.4.3 imports pkg_resources, which setuptools 81+ removed
+setuptools<81
+tqdm==4.66.1
+unstructured[all-docs]==0.18.32
+uvicorn==0.54.0
