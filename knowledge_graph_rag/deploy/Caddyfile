@@ -1,0 +1,6 @@
+# HTTPS reverse proxy for the Streamlit UI (Let's Encrypt certificates are automatic).
+# Point your domain's DNS A record at the server and set DOMAIN in .env.
+{$DOMAIN} {
+	encode gzip
+	reverse_proxy frontend:8501
+}
