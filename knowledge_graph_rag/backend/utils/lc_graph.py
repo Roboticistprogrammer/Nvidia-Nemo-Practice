@@ -13,89 +13,69 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from langchain_nvidia_ai_endpoints import ChatNVIDIA
 import concurrent.futures
+import logging
 import os
-from tqdm import tqdm
+
+import networkx as nx
+import pandas as pd
 from langchain_community.document_loaders import DirectoryLoader
 from langchain.text_splitter import RecursiveCharacterTextSplitter
-import multiprocessing
-import csv
-import streamlit as st
+
 from utils.preprocessor import extract_triples
-# function to process a single document (will run many of these processes in parallel)
+
+logger = logging.getLogger(__name__)
+
+
+# function to process a single document (many of these run in parallel)
 def process_document(doc, llm):
     try:
         return extract_triples(doc, llm)
     except Exception as e:
-        print(f"Error processing document: {e}")
+        logger.warning(f"Error processing document chunk: {e}")
         return []
 
-def process_documents(directory, llm, update_progress=None,triplets=True, chunk_size=500, chunk_overlap=100):    
-    with st.spinner("Loading and splitting documents"):
-        loader = DirectoryLoader(directory,  glob="*.pdf")
-        raw_docs = loader.load()
-        text_splitter = RecursiveCharacterTextSplitter(chunk_size=chunk_size, chunk_overlap=chunk_overlap)
-        documents = text_splitter.split_documents(raw_docs)
-        st.write("Loaded docs, len(docs): " + str(len(documents)))
-        # Save documents to CSV
-    document_data = [{"id": i, "content": doc.page_content} for i, doc in enumerate(documents)]
-    df = pd.DataFrame(document_data)
-    #df.to_csv('documents.csv', index=False)
-    # df = pd.DataFrame(document_data)
 
-    # Define the data directory and ensure it exists
-    data_directory = os.path.join(os.getcwd(), 'data')
-    os.makedirs(data_directory, exist_ok=True)
+def process_documents(directory, llm, data_dir, update_progress=None, triplets=True,
+                      chunk_size=500, chunk_overlap=100, max_workers=4):
+    """Split the PDFs in `directory`, save the chunks to documents.csv in `data_dir` and
+    (optionally) extract knowledge-graph triples from each chunk."""
+    loader = DirectoryLoader(str(directory), glob="*.pdf")
+    raw_docs = loader.load()
+    text_splitter = RecursiveCharacterTextSplitter(chunk_size=chunk_size, chunk_overlap=chunk_overlap)
+    documents = text_splitter.split_documents(raw_docs)
+    logger.info(f"Loaded {len(raw_docs)} PDFs -> {len(documents)} chunks")
 
-    # Define the path for the documents.csv file
-    documents_csv_path = os.path.join(data_directory, 'documents.csv')
+    df = pd.DataFrame([{"id": i, "content": doc.page_content} for i, doc in enumerate(documents)])
+    os.makedirs(data_dir, exist_ok=True)
+    df.to_csv(os.path.join(data_dir, "documents.csv"), index=False)
 
-    # Save the documents to CSV in the data directory
-    df.to_csv(documents_csv_path, index=False)
-    print(f"Documents saved to {documents_csv_path}")
-
-    if not triplets:
+    if not triplets or not documents:
         return documents, []
 
-    multiprocessing.set_start_method('fork', force=True)
-
-    progress_bar = st.progress(0)  # Initialize the progress bar
-    progress_text = st.empty()  # Create a placeholder for the progress text
-
-    with concurrent.futures.ProcessPoolExecutor() as executor:
+    # LLM calls are network-bound, so threads are enough (and safe inside containers)
+    results = []
+    with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
         futures = [executor.submit(process_document, doc, llm) for doc in documents]
-        results = []
-        total_futures = len(futures)
-        completed_futures = 0
-
-        for future in concurrent.futures.as_completed(futures):
+        for completed, future in enumerate(concurrent.futures.as_completed(futures), start=1):
             try:
-                result = future.result()
-                results.extend(result)
+                results.extend(future.result())
             except Exception as e:
-                print(f"Error collecting result: {e}")
-
-            completed_futures += 1
-            progress = completed_futures / total_futures
+                logger.warning(f"Error collecting result: {e}")
             if update_progress:
-                update_progress(completed_futures, total_futures)
-            progress_bar.progress(progress)  # Update the progress bar
-            progress_text.text(f"Processing: {completed_futures}/{total_futures}")  # Update the progress text
+                update_progress(completed, len(futures))
 
-    print("Processing complete. Total triples extracted:", len(results))
+    logger.info(f"Processing complete. Total triples extracted: {len(results)}")
     return documents, results
 
-import pandas as pd
 
-def save_triples_to_csvs(triples):
-    data_directory = os.path.join(os.getcwd(), 'data')
-    os.makedirs(data_directory, exist_ok=True)
+def save_triples_to_csvs(triples, data_dir):
+    os.makedirs(data_dir, exist_ok=True)
 
     # Define paths for the CSV files
-    entities_csv_path = os.path.join(data_directory, 'entities.csv')
-    relations_csv_path = os.path.join(data_directory, 'relations.csv')
-    triples_csv_path = os.path.join(data_directory, 'triples.csv')
+    entities_csv_path = os.path.join(data_dir, 'entities.csv')
+    relations_csv_path = os.path.join(data_dir, 'relations.csv')
+    triples_csv_path = os.path.join(data_dir, 'triples.csv')
     # Create the triples DataFrame
     triples_df = pd.DataFrame(triples, columns=['subject', 'subject_type', 'relation', 'object', 'object_type'])
 
@@ -132,68 +112,47 @@ def save_triples_to_csvs(triples):
     # Select necessary columns and ensure correct data types
     result_df = triples_with_ids[['entity_id_1', 'relation_id', 'entity_id_2']].astype({'entity_id_1': int, 'relation_id': int, 'entity_id_2': int})
 
-    # Write DataFrames to CSV files
-    # entities_df.to_csv('entities.csv', index=False)
-    # relations_df.to_csv('relations.csv', index=False)
-    # result_df.to_csv('triples.csv', index=False)
     entities_df.to_csv(entities_csv_path, index=False)
     relations_df.to_csv(relations_csv_path, index=False)
     result_df.to_csv(triples_csv_path, index=False)
 
-if __name__ == "__main__":
-    llm = ChatNVIDIA(model="ai-mixtral-8x7b-instruct")
-    results = process_documents("papers/", llm)
 
-    # write the resulting entities to a CSV, relations to a CSV and all triples with IDs to a CSV
-    save_triples_to_csvs(results)
+def build_graphml(data_dir):
+    """Build the knowledge graph from the saved CSVs and write knowledge_graph.graphml."""
+    triples_df = pd.read_csv(os.path.join(data_dir, "triples.csv"))
+    entities_df = pd.read_csv(os.path.join(data_dir, "entities.csv"))
+    relations_df = pd.read_csv(os.path.join(data_dir, "relations.csv"))
 
-    # load the CSV triples, entities and relations into pandas objects (accelerated by cuDF/cuGraph)
-    import pandas as pd
-    import networkx as nx
+    entity_name_map = entities_df.set_index("entity_id")["entity_name"].to_dict()
+    relation_name_map = relations_df.set_index("relation_id")["relation_name"].to_dict()
 
-    # # Load the triples from the CSV file
-    # triples_df = pd.read_csv("triples.csv", header=None, names=["Entity1_ID", "relation", "Entity2_ID"])
-
-    # # Load the entities and relations DataFrames
-    # entity_df = pd.read_csv("entities.csv", header=None, names=["ID", "Entity"])
-    # relations_df = pd.read_csv("relations.csv", header=None, names=["ID", "relation"])
-    triples_df = pd.read_csv(os.path.join(data_directory, "triples.csv"), header=None, names=["Entity1_ID", "relation", "Entity2_ID"])
-    entity_df = pd.read_csv(os.path.join(data_directory, "entities.csv"), header=None, names=["ID", "Entity"])
-    relations_df = pd.read_csv(os.path.join(data_directory, "relations.csv"), header=None, names=["ID", "relation"])
-
-    # Create a mapping from IDs to entity names and relation names
-    entity_name_map = entity_df.set_index("ID")["Entity"].to_dict()
-    relation_name_map = relations_df.set_index("ID")["relation"].to_dict()
-
-    # Create the graph from the triples DataFrame using accelerated networkX-cuGraph integration
     G = nx.from_pandas_edgelist(
         triples_df,
-        source="Entity1_ID",
-        target="Entity2_ID",
-        edge_attr="relation",
+        source="entity_id_1",
+        target="entity_id_2",
+        edge_attr="relation_id",
         create_using=nx.DiGraph,
     )
-
-    # Relabel the nodes with the actual entity names
     G = nx.relabel_nodes(G, entity_name_map)
+    edge_attributes = nx.get_edge_attributes(G, "relation_id")
+    nx.set_edge_attributes(G, {
+        (u, v): relation_name_map[edge_attributes[(u, v)]]
+        for u, v in G.edges()
+        if edge_attributes[(u, v)] in relation_name_map
+    }, "relation")
 
-    # Relabel the edges with the actual relation names
-    edge_attributes = nx.get_edge_attributes(G, "relation")
-    nx.set_edge_attributes(G, {(u, v): relation_name_map[edge_attributes[(u, v)]] for u, v in G.edges()}, "relation")
-
-    # Save the graph to a GraphML file so it can be visualized in Gephi Lite
-    graphml_path = os.path.join(data_directory, "knowledge_graph.graphml")
-
-    #nx.write_graphml(G, "knowledge_graph.graphml")
+    graphml_path = os.path.join(data_dir, "knowledge_graph.graphml")
     nx.write_graphml(G, graphml_path)
+    return graphml_path
 
-    # Query the graph using LangChain
-    from langchain.chains import GraphQAChain
-    from langchain.indexes.graph import NetworkxEntityGraph
-    graph = NetworkxEntityGraph(G)
-    # print(graph.get_triples())
 
-    # llm.invoke("hello")
-    chain = GraphQAChain.from_llm(llm = llm, graph=graph, verbose=True)
-    res = chain.run("explain how URDFormer and vision transformer is related")
-    print(res)
+if __name__ == "__main__":
+    # Standalone run: python -m utils.lc_graph (uses NVIDIA_API_KEY from the environment)
+    from langchain_nvidia_ai_endpoints import ChatNVIDIA
+    import config
+
+    llm = ChatNVIDIA(model=config.LLM_MODELS[0])
+    out_dir = "data"
+    documents, results = process_documents("papers/", llm, out_dir)
+    save_triples_to_csvs(results, out_dir)
+    print("Graph written to", build_graphml(out_dir))

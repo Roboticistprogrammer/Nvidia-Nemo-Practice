@@ -13,110 +13,110 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-import os
-import pandas as pd
-import networkx as nx
-from fastapi import APIRouter, BackgroundTasks
-from fastapi.responses import JSONResponse
+import json
+import logging
+import time
+
+from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException
+from fastapi.responses import FileResponse
 from pydantic import BaseModel
-from utils.lc_graph import process_documents, save_triples_to_csvs
+
+import config
+from auth import Workspace, get_workspace
+from utils.lc_graph import process_documents, save_triples_to_csvs, build_graphml
+from utils.models import get_chat_models, make_llm, without_reasoning
+from utils.rag import graph_path
 from vectorstore.search import SearchHandler
-from langchain_nvidia_ai_endpoints import ChatNVIDIA
-from dotenv import load_dotenv
-load_dotenv()
 
-# Get the data directory path from environment variables
-DATA_DIR = os.getenv("DATA_DIR") 
-
+logger = logging.getLogger(__name__)
 
 # Initialize a FastAPI router
 router = APIRouter()
 
-# Define a Pydantic model for the request body
-class DirectoryRequest(BaseModel):
-    directory: str
+STATUS_FILE = "status.json"
+# a "running" status older than this is treated as stale (e.g. the server restarted mid-job)
+STALE_AFTER_S = 3 * 3600
+
+
+class ProcessRequest(BaseModel):
     model_id: str
+
+
+def _write_status(ws, state, progress=0.0, message=""):
+    ws.file(STATUS_FILE).write_text(json.dumps(
+        {"state": state, "progress": progress, "message": message, "updated": time.time()}
+    ))
+
+
+def _read_status(ws):
+    path = ws.file(STATUS_FILE)
+    if not path.exists():
+        return {"state": "idle", "progress": 0.0, "message": ""}
+    return json.loads(path.read_text())
+
+
 # Define an endpoint to get available models
 @router.get("/get-models/")
-async def get_models():
-    models = ChatNVIDIA.get_available_models()
-    available_models = [model.id for model in models if model.model_type == "chat" and "instruct" in model.id]
-    return {"models": available_models}
+def get_models():
+    return {"models": get_chat_models()}
 
-# Define an endpoint to process documents
+
+# Define an endpoint to process the documents uploaded to the caller's workspace
 @router.post("/process-documents/")
-async def process_documents_endpoint(request: DirectoryRequest, background_tasks: BackgroundTasks):
-    directory = request.directory
-    model_id = request.model_id
-    llm = ChatNVIDIA(model=model_id)
+def process_documents_endpoint(request: ProcessRequest, background_tasks: BackgroundTasks,
+                               ws: Workspace = Depends(get_workspace)):
+    if not any(ws.uploads_dir.glob("*.pdf")):
+        raise HTTPException(400, "No PDFs uploaded yet. Upload at least one PDF first.")
+    status = _read_status(ws)
+    if status["state"] == "running" and time.time() - status.get("updated", 0) < STALE_AFTER_S:
+        raise HTTPException(409, "Documents are already being processed in this workspace.")
 
-    # Save progress updates in a temporary file
-    progress_file = "progress.txt"
-    with open(progress_file, "w") as f:
-        f.write("0")
+    llm = make_llm(ws, request.model_id)
+    _write_status(ws, "running", 0.0, "Loading and splitting PDFs")
 
-    def update_progress(completed_futures, total_futures):
-        progress = completed_futures / total_futures
-        with open(progress_file, "w") as f:
-            f.write(str(progress))
-    # Define a background task for processing documents
+    def update_progress(completed, total):
+        _write_status(ws, "running", completed / total, f"Extracting triples: {completed}/{total} chunks")
+
     def background_task():
-        documents, results = process_documents(directory, llm, update_progress=update_progress)
-        search_handler = SearchHandler("hybrid_demo3", use_bge_m3=True, use_reranker=True)
-        search_handler.insert_data(documents)
-        save_triples_to_csvs(results)
-        
-        # Load data from CSV files
-        triples_csv_path = os.path.join(DATA_DIR, "triples.csv")
-        entities_csv_path = os.path.join(DATA_DIR, "entities.csv")
-        relations_csv_path = os.path.join(DATA_DIR, "relations.csv")
-        triples_df = pd.read_csv(triples_csv_path)
-        entities_df = pd.read_csv(entities_csv_path)
-        relations_df = pd.read_csv(relations_csv_path)
-
-        entity_name_map = entities_df.set_index("entity_id")["entity_name"].to_dict()
-        relation_name_map = relations_df.set_index("relation_id")["relation_name"].to_dict()
-        
-        # Create a graph from the triples data
-        G = nx.from_pandas_edgelist(
-            triples_df,
-            source="entity_id_1",
-            target="entity_id_2",
-            edge_attr="relation_id",
-            create_using=nx.DiGraph,
-        )
-
-        G = nx.relabel_nodes(G, entity_name_map)
-        edge_attributes = nx.get_edge_attributes(G, "relation_id")
-
-        new_edge_attributes = {
-            (u, v): relation_name_map[edge_attributes[(u, v)]]
-            for u, v in G.edges()
-            if edge_attributes[(u, v)] in relation_name_map
-        }
-        nx.set_edge_attributes(G, new_edge_attributes, "relation")
-
-       # Save the graph to a GraphML file
-        graphml_path = os.path.join(DATA_DIR, "knowledge_graph.graphml")
-        nx.write_graphml(G, graphml_path)
+        try:
+            documents, results = process_documents(
+                ws.uploads_dir, without_reasoning(llm), ws.data_dir, update_progress=update_progress,
+                max_workers=config.EXTRACTION_WORKERS,
+            )
+            if not results:
+                raise RuntimeError("No triples were extracted. Check that the PDFs contain text "
+                                   "and that the selected model is available.")
+            _write_status(ws, "running", 1.0, "Indexing chunks in the vector store")
+            search_handler = SearchHandler(ws.collection, use_bge_m3=True, use_reranker=True)
+            search_handler.reset()
+            search_handler.insert_data(documents)
+            save_triples_to_csvs(results, ws.data_dir)
+            build_graphml(ws.data_dir)
+            _write_status(ws, "done", 1.0, f"Graph built from {len(documents)} chunks and {len(results)} triples.")
+        except Exception as e:
+            logger.exception("Document processing failed")
+            _write_status(ws, "error", 0.0, str(e))
 
     background_tasks.add_task(background_task)
     return {"message": "Processing started"}
+
+
 # Define an endpoint to get the progress of the background task
 @router.get("/progress/")
-async def get_progress():
-    try:
-        with open("progress.txt", "r") as f:
-            progress = f.read()
-        return {"progress": progress}
-    except FileNotFoundError:
-        return {"progress": "0"}
+def get_progress(ws: Workspace = Depends(get_workspace)):
+    return _read_status(ws)
+
 
 # Define an endpoint to check if the GraphML file exists
 @router.get("/check-file-exists/")
-async def check_file_exists():
-    graphml_path = os.path.join(DATA_DIR, "knowledge_graph.graphml")
-    if os.path.exists(graphml_path):
-        return JSONResponse(content={"file_exists": True})
-    else:
-        return JSONResponse(content={"file_exists": False})
+def check_file_exists(ws: Workspace = Depends(get_workspace)):
+    return {"file_exists": graph_path(ws).exists()}
+
+
+# Download the workspace's knowledge graph (e.g. to open it in Gephi Lite)
+@router.get("/graph/")
+def download_graph(ws: Workspace = Depends(get_workspace)):
+    path = graph_path(ws)
+    if not path.exists():
+        raise HTTPException(404, "No knowledge graph yet. Process your documents first.")
+    return FileResponse(path, media_type="application/xml", filename="knowledge_graph.graphml")

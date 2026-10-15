@@ -13,17 +13,9 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-import getpass
-import os
 import json
 import ast
-from langchain_nvidia_ai_endpoints import ChatNVIDIA
 from langchain.prompts import PromptTemplate
-
-if not os.environ.get("NVIDIA_API_KEY", "").startswith("nvapi-"):
-    nvapi_key = getpass.getpass("Enter your NVIDIA API key: ")
-    assert nvapi_key.startswith("nvapi-"), f"{nvapi_key[:5]}... is not a valid key"
-    os.environ["NVIDIA_API_KEY"] = nvapi_key
 
 from langchain_core.output_parsers import StrOutputParser
 from langchain_core.prompts import ChatPromptTemplate

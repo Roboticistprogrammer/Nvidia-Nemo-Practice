@@ -12,97 +12,125 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-import os
-import asyncio
+
+import csv
+import json
+import logging
 import random
+import re
+from concurrent.futures import ThreadPoolExecutor
+
 import pandas as pd
-import networkx as nx
-from fastapi import APIRouter, HTTPException, BackgroundTasks
+from fastapi import APIRouter, Depends, HTTPException
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
-from concurrent.futures import ThreadPoolExecutor
-from langchain_nvidia_ai_endpoints import ChatNVIDIA, NVIDIAEmbeddings
-from langchain.chains import GraphQAChain, LLMChain
-from vectorstore.search import SearchHandler
-from langchain_core.output_parsers import StrOutputParser
-from langchain_core.prompts import ChatPromptTemplate
-from langchain_community.graphs.networkx_graph import NetworkxEntityGraph
-from utils.preprocessor import generate_qa_pair, judge_prompt_template
-from utils.lc_graph import process_documents, save_triples_to_csvs
-from llama_index.core import SimpleDirectoryReader
-from openai import OpenAI
 from langchain.schema import Document
-import csv 
-import json
-import time
-import logging
-import re 
+from openai import OpenAI
 
 from datasets import Dataset
-from ragas.metrics import faithfulness, answer_relevancy, context_precision, context_recall
+from ragas.metrics import answer_relevancy, context_precision
 from ragas import evaluate
 from ragas.embeddings import LangchainEmbeddingsWrapper
 from ragas.llms import LangchainLLMWrapper
 
+import config
+from auth import Workspace, get_workspace
+from utils.lc_graph import process_documents
+from utils.models import get_chat_models, make_llm, make_embeddings
+from utils.preprocessor import generate_qa_pair, judge_prompt_template
+from utils import rag
 
-logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 router = APIRouter()
 
+DOCUMENTS_CSV = "documents.csv"
+QA_CSV = "qa_data.csv"
+COMBINED_CSV = "combined_results.csv"
+SCORE_COLUMNS = ['gt', 'textRAG', 'graphRAG', 'combinedRAG']
+
+
 class ProcessRequest(BaseModel):
-    directory: str
     model_id: str
+
 
 class QAPairsRequest(BaseModel):
     num_data: int
     model_id: str
-    
+
 
 class QARequest(BaseModel):
     questions_list: list
     answers_list: list
     model_id: str
 
+
 class ScoreRequest(BaseModel):
     combined_results: list
 
-reward_client = OpenAI(
-    base_url="https://integrate.api.nvidia.com/v1",
-    api_key=os.environ["NVIDIA_API_KEY"]
-)
+
+def _stream(rows):
+    """NDJSON streaming; a plain generator runs in FastAPI's threadpool, not the event loop."""
+    return StreamingResponse((json.dumps(row) + "\n" for row in rows), media_type="text/event-stream")
+
+
+def _read_records(ws, name, missing_msg):
+    path = ws.file(name)
+    if not path.exists():
+        raise HTTPException(404, missing_msg)
+    return pd.read_csv(path).fillna("").to_dict(orient="records")
+
+
 @router.get("/get-models/")
-async def get_models():
-    models = ChatNVIDIA.get_available_models()
-    available_models = [model.id for model in models if model.model_type == "chat" and "instruct" in model.id]
-    return {"models": available_models}
+def get_models():
+    return {"models": get_chat_models()}
 
-def load_data(input_dir, num_workers):
-    reader = SimpleDirectoryReader(input_dir=input_dir)
-    documents = reader.load_data(num_workers=num_workers)
-    return documents
 
-def get_reward_scores(question, answer):
-    completion = reward_client.chat.completions.create(
-        model="nvidia/nemotron-4-340b-reward",
-        messages=[{"role": "user", "content": question}, {"role": "assistant", "content": answer}]
-    )
+@router.get("/config")
+def eval_config():
+    """Which scoring methods are enabled, and with which models (shown in the UI)."""
+    return {
+        "judge_model": get_chat_models()[0],
+        "embed_model": config.EVAL_EMBED_MODEL,
+        "reward_model": config.REWARD_MODEL or None,
+    }
+
+
+# ---- RAG variants compared by the evaluation ----
+
+def get_text_RAG_response(ws, question, llm):
+    passages = rag.search_passages(ws, question, k=5)
+    answer = rag.answer_with_context(llm, rag.passages_context(passages), question)
+    return answer, passages
+
+
+def get_graph_RAG_response(ws, question, llm, graph):
     try:
-        content = completion.choices[0].message[0].content
-        res = content.split(",")
-        content_dict = {}
-        for item in res:
-            name, val = item.split(":")
-            content_dict[name] = float(val)
-        return content_dict
-    except:
-        return None
+        triplets = rag.graph_triplets(graph, rag.extract_entities(llm, question))
+        context = rag.triplets_context(triplets)
+        context_return = triplets or ["no relationship found"]
+    except Exception:
+        context, context_return = rag.NO_TRIPLES_CONTEXT, []
+    return rag.answer_with_context(llm, context, question), context_return
 
-def process_question(question, answer, llm):
+
+def get_combined_RAG_response(ws, question, llm, graph):
+    try:
+        entities = rag.extract_entities(llm, question)
+        passages = rag.search_passages(ws, question, k=5)
+        triplets = rag.graph_triplets(graph, entities)
+        context = rag.passages_context(passages) + "\n\n" + rag.triplets_context(triplets)
+        context_return = passages + triplets
+    except Exception:
+        context, context_return = rag.NO_TRIPLES_CONTEXT, []
+    return rag.answer_with_context(llm, context, question), context_return
+
+
+def process_question(ws, question, answer, llm, graph):
     with ThreadPoolExecutor(max_workers=3) as executor:
-        future_text = executor.submit(get_text_RAG_response, question, llm)
-        future_graph = executor.submit(get_graph_RAG_response, question, llm)
-        future_combined = executor.submit(get_combined_RAG_response, question, llm)
+        future_text = executor.submit(get_text_RAG_response, ws, question, llm)
+        future_graph = executor.submit(get_graph_RAG_response, ws, question, llm, graph)
+        future_combined = executor.submit(get_combined_RAG_response, ws, question, llm, graph)
 
         text_RAG_response, text_RAG_context_response = future_text.result()
         graph_RAG_response, graph_RAG_context_response = future_graph.result()
@@ -119,318 +147,177 @@ def process_question(question, answer, llm):
         "combined_RAG_context_response": combined_RAG_context_response
     }
 
-prompt_template = ChatPromptTemplate.from_messages(
-    [("system", "You are a helpful AI assistant named Envie. You will reply to questions only based on the context that you are provided. If something is out of context, you will refrain from replying and politely decline to respond to the user."), ("user", "{input}")]
-)
 
-DATA_DIR = os.getenv("DATA_DIR") 
-KG_GRAPHML_PATH = os.path.join(DATA_DIR, "knowledge_graph.graphml")
-logger.info(KG_GRAPHML_PATH)
-
-
-def get_text_RAG_response(question, llm):
-    chain = prompt_template | llm | StrOutputParser()
-    search_handler = SearchHandler("hybrid_demo3", use_bge_m3=True, use_reranker=True)
-    res = search_handler.search_and_rerank(question, k=5)
-    context = "Here are the relevant passages from the knowledge base: \n\n" + "\n".join(item.text for item in res)
-    context_return = []
-    if res:
-        context_return = [item.text for item in res]
-    answer = chain.invoke("Context: " + context + "\n\nUser query: " + question)
-    return answer, context_return
-
-def get_graph_RAG_response(question, llm):
-    chain = prompt_template | llm | StrOutputParser()
-    entity_string = llm.invoke("""Return a JSON with a single key 'entities' and list of entities within this user query. Each element in your list MUST BE part of the user's query. Do not provide any explanation. If the returned list is not parseable in Python, you will be heavily penalized. For example, input: 'What is the difference between Apple and Google?' output: ['Apple', 'Google']. Always follow this output format. Here's the user query: """ + question)
-    graphml_path = KG_GRAPHML_PATH 
-    
-    G = nx.read_graphml(graphml_path)
-    
-    graph = NetworkxEntityGraph(G)
-
-    try:
-        entities = json.loads(entity_string.content)['entities']
-        context = ""
-        all_triplets = []
-        for entity in entities:
-            all_triplets.extend(graph.get_entity_knowledge(entity, depth=2))
-        context = "Here are the relationships from the knowledge graph: " + "\n".join(all_triplets)
-        context_return = []
-        if all_triplets:
-            context_return = [trip for trip in all_triplets]
-        else:
-            context_return = ["no relationship found"]
-    except:
-        context = "No graph triples were available to extract from the knowledge graph. Always provide a disclaimer if you know the answer to the user's question, since it is not grounded in the knowledge you are provided from the graph."
-    answer = chain.invoke("Context: " + context + "\n\nUser query: " + question)
-    return answer, context_return
-
-def get_combined_RAG_response(question, llm):
-    chain = prompt_template | llm | StrOutputParser()
-    entity_string = llm.invoke("""Return a JSON with a single key 'entities' and list of entities within this user query. Each element in your list MUST BE part of the user's query. Do not provide any explanation. If the returned list is not parseable in Python, you will be heavily penalized. For example, input: 'What is the difference between Apple and Google?' output: ['Apple', 'Google']. Always follow this output format. Here's the user query: """ + question)
-    graphml_path = KG_GRAPHML_PATH 
-    G = nx.read_graphml(graphml_path)
-    graph = NetworkxEntityGraph(G)
-
-    try:
-        entities = json.loads(entity_string.content)['entities']
-        search_handler = SearchHandler("hybrid_demo3", use_bge_m3=True, use_reranker=True)
-        res = search_handler.search_and_rerank(question, k=5)
-        context = "Here are the relevant passages from the knowledge base: \n\n" + "\n".join(item.text for item in res)
-        context_return = []
-        if res:
-            context_return = [item.text for item in res]
-
-        all_triplets = []
-        for entity in entities:
-            all_triplets.extend(graph.get_entity_knowledge(entity, depth=2))
-        context += "\n\nHere are the relationships from the knowledge graph: " + "\n".join(all_triplets)
-        if all_triplets:
-            for trip in all_triplets:
-                context_return.append(trip)
-    except Exception as e:
-        context = "No graph triples were available to extract from the knowledge graph. Always provide a disclaimer if you know the answer to the user's question, since it is not grounded in the knowledge you are provided from the graph."
-    answer = chain.invoke("Context: " + context + "\n\nUser query: " + question)
-    return answer, context_return
+# ---- Pipeline endpoints ----
 
 @router.post("/process-documents/")
-async def process_documents_endpoint(request: ProcessRequest, background_tasks: BackgroundTasks):
-    logger.info("Check")
-    directory = request.directory
-    model_id = request.model_id
-    llm = ChatNVIDIA(model=model_id)
-    logger.info(f"Processing documents in directory: {directory} with model: {model_id}")
-    try:
-        documents, results = process_documents(directory, llm, triplets=False, chunk_size=2000, chunk_overlap=200)
-        logger.info(f"Processed {len(documents)} documents.")
-        data_directory = os.path.join(os.getcwd(), 'data')
-        os.makedirs(data_directory, exist_ok=True)
+def process_documents_endpoint(request: ProcessRequest, ws: Workspace = Depends(get_workspace)):
+    if not any(ws.uploads_dir.glob("*.pdf")):
+        raise HTTPException(400, "No PDFs uploaded yet. Upload at least one PDF first.")
+    llm = make_llm(ws, request.model_id)
+    documents, _ = process_documents(ws.uploads_dir, llm, ws.data_dir, triplets=False,
+                                     chunk_size=2000, chunk_overlap=200)
+    logger.info(f"Split {len(documents)} evaluation chunks for workspace {ws.id[:8]}")
+    return {"message": "Documents processed", "documents_processed": len(documents)}
 
-    # Define the path for the documents.csv file
-        documents_csv_path = os.path.join(data_directory, 'documents.csv')
-        logger.info(f"Path to documents.csv: {documents_csv_path}")
-        return {"message": "Document processing started", "documents_processed": len(documents)}
-    except Exception as e:
-        logger.error(f"Error processing documents: {e}")
-        raise HTTPException(status_code=500, detail="Error processing documents")
+
 @router.post("/create-qa-pairs/")
-async def create_qa_pairs(request: QAPairsRequest):
-    logger.info("Entered create_qa_pairs endpoint")
-    
-    num_data = request.num_data
-    model_id = request.model_id
-    llm = ChatNVIDIA(model=model_id)
+def create_qa_pairs(request: QAPairsRequest, ws: Workspace = Depends(get_workspace)):
+    llm = make_llm(ws, request.model_id)
+    df = pd.DataFrame(_read_records(ws, DOCUMENTS_CSV, "Documents not found. Please process documents first."))
+    documents = [Document(page_content=str(row['content'])) for _, row in df.iterrows()]
+    qa_docs = random.sample(documents, min(request.num_data, len(documents)))
 
-    current_directory = os.getcwd()
-    data_directory = os.path.join(os.getcwd(), 'data')
-    os.makedirs(data_directory, exist_ok=True)
-
-    # Define the path for the documents.csv file
-    documents_csv_path = os.path.join(data_directory, 'documents.csv')
-    logger.info(f"Path to documents.csv in QA: {documents_csv_path}")
-    
-    logger.info(f"Current working directory: {current_directory}")
-    logger.info(f"Path to documents.csv: {documents_csv_path}")
-    
-    if not os.path.exists(documents_csv_path):
-        logger.error("Documents not found. Please process documents first.")
-        raise HTTPException(status_code=404, detail="Documents not found. Please process documents first.")
-    
-    df = pd.read_csv(documents_csv_path)
-    documents = [Document(page_content=row['content']) for index, row in df.iterrows()]
-    logger.info(f"Total documents available: {len(documents)}")
-    
-    async def event_generator():
+    def generate():
         json_list = []
-        qa_docs = random.sample(documents, num_data)
         for doc in qa_docs:
             try:
                 res = generate_qa_pair(doc, llm)
                 if res:
-                    # Append to list and write to file incrementally if needed
                     json_list.append(res)
-                    yield json.dumps(res) + "\n"
-                    await asyncio.sleep(1)  # Simulate processing time
+                    yield res
             except Exception as e:
                 logger.error(f"Error generating Q&A pair: {e}")
-                yield json.dumps({"error": str(e)}) + "\n"
-
-        # Save the list to a file after processing all documents
+                yield {"error": str(e)}
         if json_list:
-
-            qa_df = pd.DataFrame(json_list)
-            data_directory = os.path.join(os.getcwd(), 'data')
-            os.makedirs(data_directory, exist_ok=True)
-            qa_df_path = os.path.join(data_directory, 'qa_data.csv')
-            qa_df.to_csv(qa_df_path, index=False)
-            logger.info("qa_data.csv created successfully.")
+            pd.DataFrame(json_list).to_csv(ws.file(QA_CSV), index=False)
         else:
-            logger.error("No Q&A pairs generated")
-            raise HTTPException(status_code=500, detail="No Q&A pairs generated")
-        
+            yield {"error": "No Q&A pairs generated"}
 
-    return StreamingResponse(event_generator(), media_type="text/event-stream")
+    return _stream(generate())
+
+
+@router.get("/qa-data/")
+def get_qa_data(ws: Workspace = Depends(get_workspace)):
+    return {"records": _read_records(ws, QA_CSV, "No Q&A data yet. Create Q&A pairs first.")}
+
+
 @router.post("/run-evaluation/")
-async def run_evaluation(request: QARequest):
-    questions_list = request.questions_list
-    answers_list = request.answers_list
-    model_id = request.model_id
-    llm = ChatNVIDIA(model=model_id)  # or any other default model
+def run_evaluation(request: QARequest, ws: Workspace = Depends(get_workspace)):
+    llm = make_llm(ws, request.model_id)
+    graph = rag.load_graph(ws)
+    if graph is None:
+        raise HTTPException(404, "No knowledge graph yet. Build it on the main page first.")
+    combined_path = ws.file(COMBINED_CSV)
+    combined_path.unlink(missing_ok=True)
 
-    
-    async def evaluate():
-        results = []
-        for question, answer in zip(questions_list, answers_list):
-            result = process_question(question, answer, llm)
-            results.append(result)
-
+    def evaluate_all():
+        for question, answer in zip(request.questions_list, request.answers_list):
+            result = process_question(ws, question, answer, llm, graph)
             # Save the result to the CSV file incrementally
-            data_directory = os.path.join(os.getcwd(), 'data')
-            os.makedirs(data_directory, exist_ok=True)
-
-            combined_results_path = os.path.join(DATA_DIR, "combined_results.csv")
-            with open(combined_results_path, "a", newline="") as csvfile:
+            with open(combined_path, "a", newline="") as csvfile:
                 writer = csv.DictWriter(csvfile, fieldnames=result.keys())
                 if csvfile.tell() == 0:
                     writer.writeheader()
                 writer.writerow(result)
+            yield result
 
-            yield json.dumps(result) + "\n"
-            await asyncio.sleep(0.1) 
-    
-    return StreamingResponse(evaluate(), media_type="text/event-stream")
+    return _stream(evaluate_all())
+
+
+@router.get("/combined-results/")
+def get_combined_results(ws: Workspace = Depends(get_workspace)):
+    return {"records": _read_records(ws, COMBINED_CSV, "No evaluation results yet. Run the evaluation first.")}
+
+
+# ---- Scoring ----
+
+def _score_rows(ws, rows, score_fn, out_name):
+    """Score every answer variant of each row, stream rows back and save them when done."""
+    scored = []
+    for row in rows:
+        try:
+            answers = [row["gt_answer"], row["textRAG_answer"], row["graphRAG_answer"], row["combined_answer"]]
+            contexts = [row["combined_RAG_context_response"], row["text_RAG_context_response"],
+                        row["graph_RAG_context_response"], row["combined_RAG_context_response"]]
+            for score_type, answer, context in zip(SCORE_COLUMNS, answers, contexts):
+                res = score_fn(row, answer, context)
+                for metric, value in (res or {}).items():
+                    row[f'{score_type}_{metric}'] = value
+            scored.append(row)
+            yield row
+        except Exception as e:
+            yield {"error": str(e)}
+    if scored:
+        pd.DataFrame(scored).to_csv(ws.file(out_name), index=False)
+
+
+def get_reward_scores(reward_client, question, answer):
+    completion = reward_client.chat.completions.create(
+        model=config.REWARD_MODEL,
+        messages=[{"role": "user", "content": question}, {"role": "assistant", "content": answer}]
+    )
+    try:
+        content = completion.choices[0].message[0].content
+        res = content.split(",")
+        content_dict = {}
+        for item in res:
+            name, val = item.split(":")
+            content_dict[name] = float(val)
+        return content_dict
+    except Exception:
+        return None
+
 
 @router.post("/run-scoring/")
-async def run_scoring(request: ScoreRequest):
-    combined_results = request.combined_results
-
-    score_columns = ['gt', 'textRAG', 'graphRAG', 'combinedRAG']
+def run_scoring(request: ScoreRequest, ws: Workspace = Depends(get_workspace)):
+    if not config.REWARD_MODEL:
+        raise HTTPException(400, "Reward-model scoring is disabled on this server (REWARD_MODEL is not set).")
+    reward_client = OpenAI(base_url="https://integrate.api.nvidia.com/v1", api_key=ws.api_key)
     metrics = ['helpfulness', 'correctness', 'coherence', 'complexity', 'verbosity']
-    
-    async def score_generator():
-        for row in combined_results:
-            try:
-                res_gt = get_reward_scores(row["question"], row["gt_answer"])
-                res_textRAG = get_reward_scores(row["question"], row["textRAG_answer"])
-                res_graphRAG = get_reward_scores(row["question"], row["graphRAG_answer"])
-                res_combinedRAG = get_reward_scores(row["question"], row["combined_answer"])
-                for score_type, res in zip(score_columns, [res_gt, res_textRAG, res_graphRAG, res_combinedRAG]):
-                     if res:
-                        for metric in metrics:
-                            row[f'{score_type}_{metric}'] = res.get(metric,None)
-                yield json.dumps(row) + "\n"
-                await asyncio.sleep(0.1)  # Simulate processing delay
-            except Exception as e:
-                yield json.dumps({"error": str(e)}) + "\n"
 
-    return StreamingResponse(score_generator(), media_type="text/event-stream")
+    def score(row, answer, _context):
+        res = get_reward_scores(reward_client, row["question"], answer)
+        return {m: res.get(m) for m in metrics} if res else None
+
+    return _stream(_score_rows(ws, request.combined_results, score, "combined_results_with_scores_nemotron.csv"))
+
 
 def get_RAGAS_evaluation(question, rag_answer, context, gt_answer, llm, embeddings, metrics):
-    
-    list_items = context.split(',')
-    list_items = [item.strip() for item in list_items]
-    d_eval = {
+    list_items = [item.strip() for item in str(context).split(',')]
+    d_eval_dataset = Dataset.from_dict({
         "question": [question],
         "answer": [rag_answer],
         "contexts": [list_items],
         "ground_truth": [gt_answer]
-    }
-    d_eval_dataset = Dataset.from_dict(d_eval)
-    result = evaluate(d_eval_dataset, metrics=metrics,llm=llm, embeddings=embeddings)
-    print(result)
-    # Iterate over the scores
+    })
+    result = evaluate(d_eval_dataset, metrics=metrics, llm=llm, embeddings=embeddings)
     context_result = {}
     for score in result.scores:
         for m, value in score.items():
             context_result[f"{m}"] = value
-
     return context_result
 
-@router.post("/run-scoring-RAGAS/")
-async def run_scoring_RAGAS(request: ScoreRequest):
-    combined_results = request.combined_results
-    
-    # RAGAS evaluation uses your own LLM and embeddings model
-    llm = ChatNVIDIA( model="meta/llama3-70b-instruct", temperature=0.2, max_tokens=300,)
-    embeddings = NVIDIAEmbeddings(model="nvidia/nv-embed-v1")
-    llm = LangchainLLMWrapper(langchain_llm=llm)
-    embeddings = LangchainEmbeddingsWrapper(embeddings)
 
-    score_columns = ['gt', 'textRAG', 'graphRAG', 'combinedRAG']
+@router.post("/run-scoring-RAGAS/")
+def run_scoring_RAGAS(request: ScoreRequest, ws: Workspace = Depends(get_workspace)):
+    # RAGAS evaluation uses your own LLM and embeddings model
+    llm = LangchainLLMWrapper(langchain_llm=make_llm(ws, temperature=0.2))
+    embeddings = LangchainEmbeddingsWrapper(make_embeddings(ws))
     metrics = [answer_relevancy, context_precision]
 
-    async def score_generator():
-        for row in combined_results:
-            try:
-                res_gtRAG = get_RAGAS_evaluation(row['question'], row['gt_answer'], row['combined_RAG_context_response'], row['gt_answer'], llm, embeddings, metrics)
-                res_textRAG = get_RAGAS_evaluation(row['question'], row['textRAG_answer'], row['text_RAG_context_response'], row['gt_answer'], llm, embeddings, metrics)
-                res_graphRAG = get_RAGAS_evaluation(row['question'], row['graphRAG_answer'], row['graph_RAG_context_response'], row['gt_answer'], llm, embeddings, metrics)
-                res_combinedRAG = get_RAGAS_evaluation(row['question'], row['combined_answer'], row['combined_RAG_context_response'], row['gt_answer'], llm, embeddings, metrics)
+    def score(row, answer, context):
+        return get_RAGAS_evaluation(row['question'], answer, context, row['gt_answer'], llm, embeddings, metrics)
 
-                for score_type, res in zip(score_columns, [res_gtRAG, res_textRAG, res_graphRAG, res_combinedRAG]):
-                     if res:
-                        for m in res:
-                            row[f'{score_type}_{m}'] = res[m]
-                yield json.dumps(row) + "\n"
-                await asyncio.sleep(0.1)  # Simulate processing delay
-            except Exception as e:
-                yield json.dumps({"error": str(e)}) + "\n"
-            break
-
-    return StreamingResponse(score_generator(), media_type="text/event-stream")
+    return _stream(_score_rows(ws, request.combined_results, score, "combined_results_with_scores_RAGAS.csv"))
 
 
 def get_llm_as_a_judge_scores(question, answer, llm, QA_PROMPT):
-    
-    formatted_prompt = QA_PROMPT.format(question=question, answer=answer)
-    result = llm.invoke(formatted_prompt)
-    res = result.content 
-    try:
-        match = re.search(r'Evaluation:(.*?)Total rating:', res, flags=re.DOTALL)
-        if match:
-            eval_res = match.group(1).strip()
-        else:
-            eval_res = "no match found"
-        match = re.search(r'Total rating:\s*(\d+(?:\.\d+)?)', res, flags=re.DOTALL)
-        if match:
-            eval_score = float(match.group(1).strip())  # Extract the first group and strip whitespace
-        else:
-            eval_score = 0.0
-        content_dict = {}
-        content_dict['llm_judge_evaluation'] = eval_res
-        content_dict['llm_judge_score'] = eval_score
-        return content_dict
-    except:
-        return None
+    result = llm.invoke(QA_PROMPT.format(question=question, answer=answer))
+    res = result.content or ""
+    match = re.search(r'Evaluation:(.*?)Total rating:', res, flags=re.DOTALL)
+    eval_res = match.group(1).strip() if match else "no match found"
+    match = re.search(r'Total rating:\s*(\d+(?:\.\d+)?)', res, flags=re.DOTALL)
+    eval_score = float(match.group(1).strip()) if match else 0.0
+    return {'llm_judge_evaluation': eval_res, 'llm_judge_score': eval_score}
+
 
 @router.post("/run-scoring_llm_as_a_judge/")
-async def run_scoring_llm_as_a_judge(request: ScoreRequest):
-    combined_results = request.combined_results
-    
-    #
-    llm = ChatNVIDIA( model="meta/llama3-70b-instruct", temperature=0.2, max_tokens=300,)
-    
-    
+def run_scoring_llm_as_a_judge(request: ScoreRequest, ws: Workspace = Depends(get_workspace)):
+    llm = make_llm(ws, temperature=0.2)
     QA_PROMPT = judge_prompt_template()
-    
-    score_columns = ['gt', 'textRAG', 'graphRAG', 'combinedRAG']
 
-    async def score_generator():
-        for row in combined_results:
-            try:
-                res_gt = get_llm_as_a_judge_scores(row["question"], row["gt_answer"], llm, QA_PROMPT)
-                res_textRAG = get_llm_as_a_judge_scores(row["question"], row["textRAG_answer"], llm, QA_PROMPT)
-                res_graphRAG = get_llm_as_a_judge_scores(row["question"], row["graphRAG_answer"], llm, QA_PROMPT)
-                res_combinedRAG = get_llm_as_a_judge_scores(row["question"], row["combined_answer"], llm, QA_PROMPT)
+    def score(row, answer, _context):
+        return get_llm_as_a_judge_scores(row["question"], answer, llm, QA_PROMPT)
 
-                for score_type, res in zip(score_columns, [res_gt, res_textRAG, res_graphRAG, res_combinedRAG]):
-                     if res:
-                        for k, val in res.items():
-                            row[f'{score_type}_{k}'] = val
-                yield json.dumps(row) + "\n"
-                await asyncio.sleep(0.1)  # Simulate processing delay
-            except Exception as e:
-                yield json.dumps({"error": str(e)}) + "\n"
-
-    return StreamingResponse(score_generator(), media_type="text/event-stream")
-                
+    return _stream(_score_rows(ws, request.combined_results, score, "combined_results_with_scores_LLM-AS-A-JUDGE.csv"))
