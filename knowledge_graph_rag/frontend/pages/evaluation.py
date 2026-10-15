@@ -13,19 +13,16 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-import os
-import streamlit as st
-import requests
-import pandas as pd
 import json
-from dotenv import load_dotenv
-load_dotenv()
 
-BACKEND_URL = os.getenv("BACKEND_URL")
-DATA_DIR = os.getenv("DATA_DIR") 
+import pandas as pd
+import requests
+import streamlit as st
 
+from common import api, error_detail, model_selector, require_api_key
 
-
+st.set_page_config(layout="wide")
+require_api_key()
 
 # Custom CSS to change heading font sizes
 st.markdown("""
@@ -38,234 +35,117 @@ st.markdown("""
 
 st.title("Evaluations")
 
-st.subheader("Create synthetic Q&A pairs from large document chunks")
-
 if 'documents' not in st.session_state:
     st.session_state['documents'] = None
-if 'qa_pairs' not in st.session_state:
-    st.session_state['qa_pairs'] = []
-if 'evaluation_results' not in st.session_state:
-    st.session_state['evaluation_results'] = []
 
-response = requests.get(f"{BACKEND_URL}/evaluation/get-models/")
-if response.status_code == 200:
-    available_models = response.json()["models"]
-else:
-    st.error("Error fetching models.")
-    available_models = []
-
+llm_selectbox = model_selector("evaluation")
 with st.sidebar:
-    llm_selectbox = st.selectbox("Choose an LLM", available_models, index=available_models.index("mistralai/mixtral-8x7b-instruct-v0.1") if "mistralai/mixtral-8x7b-instruct-v0.1" in available_models else 0)
-    st.write("You selected: ", llm_selectbox)
-
     num_data = st.slider("How many Q&A pairs to generate?", 10, 100, 50, step=10)
 
-def has_pdf_files(directory):
-    for file in os.listdir(directory):
-        if file.endswith(".pdf"):
-            return True
-    return False
+eval_config = api("GET", "/evaluation/config").json()
+
+
+def stream_rows(path, payload, total, table=None, show_each=False):
+    """POST to a streaming endpoint and collect the NDJSON rows it returns."""
+    rows = []
+    progress_bar = st.progress(0.0)
+    placeholder = st.empty()
+    try:
+        resp = api("POST", path, json=payload, stream=True)
+        if not resp.ok:
+            st.error(error_detail(resp))
+            return rows
+        for line in resp.iter_lines():
+            if not line:
+                continue
+            row = json.loads(line.decode('utf-8'))
+            if "error" in row:
+                st.error(row["error"])
+                continue
+            rows.append(row)
+            if show_each:
+                st.write(row)
+            elif table:
+                placeholder.dataframe(pd.DataFrame(rows))
+            progress_bar.progress(min(len(rows) / max(total, 1), 1.0))
+    except requests.exceptions.ChunkedEncodingError as e:
+        st.error(f"Streaming error: {e}")
+    progress_bar.progress(1.0)
+    return rows
+
+
+def get_records(path):
+    resp = api("GET", path)
+    return resp.json()["records"] if resp.ok else None
+
+
+def csv_download(label, rows, file_name):
+    st.download_button(label, pd.DataFrame(rows).to_csv(index=False), file_name=file_name, mime="text/csv")
+
 
 def app():
-    # cwd = os.getcwd()
-    cwd = os.path.abspath('../backend/')
-    directories = [d for d in os.listdir(cwd) if os.path.isdir(os.path.join(cwd, d)) and not d.startswith('.') and '__' not in d]
-    selected_dir = st.selectbox("Select a directory:", directories, index=0)
-    directory = os.path.join(cwd, selected_dir)
+    st.caption("Uses the PDFs uploaded to your workspace on the main page.")
 
     # Process Documents
     with st.container():
         st.markdown("### 1. Process Documents")
         if st.button("Process Documents"):
-            res = has_pdf_files(directory)
-            if not res:
-                st.error("No PDF files found in directory! Only PDF files and text extraction are supported for now.")
-                st.stop()
-            progress_bar = st.progress(0)
-
-            process_response = requests.post(
-                f"{BACKEND_URL}/evaluation/process-documents/",
-                json={"directory": directory, "model_id": llm_selectbox}
-            )
-            if process_response.status_code == 200:
-                st.session_state["documents"] = process_response.json().get("documents_processed")
+            with st.spinner("Splitting documents..."):
+                resp = api("POST", "/evaluation/process-documents/", json={"model_id": llm_selectbox})
+            if resp.ok:
+                st.session_state["documents"] = resp.json().get("documents_processed")
                 st.success(f"Finished splitting documents! Number of documents processed: {st.session_state['documents']}")
-                progress_bar.progress(100)
             else:
-                st.error("Error processing documents.")
-                progress_bar.progress(0)
-
-   
+                st.error(error_detail(resp))
 
     # Create Q&A pairs
     with st.container():
         st.markdown("### 2. Create synthetic Q&A pairs from large document chunks")
-        if st.session_state["documents"] is not None:
-            if st.button("Create Q&A pairs"):
-                qa_placeholder = st.empty()
-                json_list = []
-                progress_bar = st.progress(0)
-                try:
-                    qa_response = requests.post(
-                        f"{BACKEND_URL}/evaluation/create-qa-pairs/",
-                        json={"num_data": num_data, "model_id": llm_selectbox},
-                        stream=True
-                    )
-                    if qa_response.status_code == 200:
-                        total_lines = 0 
-                        for line in qa_response.iter_lines():
-                            if line:
-                                try:
-                                    pair = json.loads(line.decode('utf-8'))
-                                    if 'question' in pair and 'answer' in pair:
-                                        res = {
-                                            'question': pair['question'],
-                                            'answer': pair['answer']
-                                        }
-                                        st.write(res)
-                                        json_list.append(res)
-                                        total_lines += 1
-                                        progress_bar.progress(min(total_lines / num_data, 1.0))  # Update progress
-                                    else:
-                                        st.error("Received data in an unexpected format.")
-                                        st.write(pair)  # For debugging purposes
-                                except json.JSONDecodeError:
-                                    st.error("Error decoding JSON response.")
-                        st.session_state['qa_pairs'] = json_list
-                        st.success("Q&A pair generation completed.")
-                        progress_bar.progress(100)
-                    else:
-                        st.error("Error creating Q&A pairs.")
-                        progress_bar.progress(0)
-                except requests.exceptions.ChunkedEncodingError as e:
-                    st.error(f"Streaming error: {e}")
-                    progress_bar.progress(0)
-                except Exception as e:
-                    st.error(f"Unexpected error: {e}")
-                    progress_bar.progress(0)
+        if st.session_state["documents"] is not None and st.button("Create Q&A pairs"):
+            pairs = stream_rows("/evaluation/create-qa-pairs/",
+                                {"num_data": num_data, "model_id": llm_selectbox}, num_data, show_each=True)
+            if pairs:
+                st.success("Q&A pair generation completed.")
 
-    
     # Run Evaluation
-    QA_DATA_PATH = os.path.join(DATA_DIR, "qa_data.csv")
-   
-    if os.path.exists(QA_DATA_PATH):
+    qa_records = get_records("/evaluation/qa-data/")
+    if qa_records:
         with st.container():
             st.markdown("### 3. Load Q&A data and run evaluations of text vs graph vs text+graph RAG")
             if st.button("Run Evaluation"):
-                df_csv = pd.read_csv(QA_DATA_PATH)
-                questions_list = df_csv["question"].tolist()
-                answers_list = df_csv["answer"].tolist()
-                eval_placeholder = st.empty()
-                results = []
-                progress_bar = st.progress(0)
-                total_questions = len(questions_list)
-
-                try:
-                    eval_response = requests.post(
-                        f"{BACKEND_URL}/evaluation/run-evaluation/",
-                        json={"questions_list": questions_list, "answers_list": answers_list, "model_id": llm_selectbox},
-                        stream=True
-                    )
-                    if eval_response.status_code == 200:
-                        for index, line in enumerate(eval_response.iter_lines()):
-                            if line:
-                                try:
-                                    result = json.loads(line.decode('utf-8'))
-                                    if 'question' in result and 'gt_answer' in result:
-                                        results.append(result)
-                                        st.session_state['evaluation_results'] = results
-                                        # Update the displayed DataFrame
-                                        results_df = pd.DataFrame(results)
-                                        eval_placeholder.dataframe(results_df)
-                                        progress_bar.progress(min((index + 1) / total_questions, 1.0))  # Update progress
-                                    else:
-                                        st.error("Received data in an unexpected format.")
-                                        st.write(result)  # For debugging purposes
-                                except json.JSONDecodeError:
-                                    st.error("Error decoding JSON response.")
-                        # Success message displayed after processing all lines
-                        st.success("Combined results saved to 'combined_results.csv'")
-                        progress_bar.progress(100)
-                    else:
-                        st.error("Error running evaluations.")
-                except requests.exceptions.ChunkedEncodingError as e:
-                    st.error(f"Streaming error: {e}")
-                    progress_bar.progress(0)
-
-                except Exception as e:
-                    st.error(f"Unexpected error: {e}")
-                    progress_bar.progress(0)
-    
-        
-
+                results = stream_rows("/evaluation/run-evaluation/", {
+                    "questions_list": [r["question"] for r in qa_records],
+                    "answers_list": [r["answer"] for r in qa_records],
+                    "model_id": llm_selectbox,
+                }, len(qa_records), table=True)
+                if results:
+                    st.success("Combined results saved to 'combined_results.csv'")
+                    csv_download("Download combined_results.csv", results, "combined_results.csv")
 
     # Run Scoring
-    COMBINED_RESULTS_PATH = os.path.join(DATA_DIR, "combined_results.csv")
-    if os.path.exists(COMBINED_RESULTS_PATH):
+    combined_results = get_records("/evaluation/combined-results/")
+    if combined_results:
         with st.container():
             st.markdown("### 4. Run comparative evals for saved Q&A data")
-            eval_select = st.selectbox("Choose evaluation type ? ", ("Nemotron", "RAGAS", "LLM-AS-A-JUDGE"),)
-            st.write("You selected: ", eval_select)
+            options = {
+                "LLM-AS-A-JUDGE": ("/evaluation/run-scoring_llm_as_a_judge/",
+                                   f"{eval_config['judge_model']} will be used as Judge"),
+                "RAGAS": ("/evaluation/run-scoring-RAGAS/",
+                          f"Evaluations will be done using: {eval_config['judge_model']} LLM and "
+                          f"{eval_config['embed_model']} embedding model"),
+            }
+            if eval_config.get("reward_model"):
+                options["Nemotron"] = ("/evaluation/run-scoring/",
+                                       f"Evaluations will be done using: {eval_config['reward_model']}")
+            eval_select = st.selectbox("Choose evaluation type ? ", list(options))
+            path, description = options[eval_select]
+            st.write(description)
             if st.button("Run Scoring"):
-                combined_results = pd.read_csv(COMBINED_RESULTS_PATH).to_dict(orient="records")
-                score_response = None
-                score_placeholder = st.empty()
-                results = []
-                total_items = len(combined_results)
-                progress_bar = st.progress(0)
+                results = stream_rows(path, {"combined_results": combined_results}, len(combined_results), table=True)
+                if results:
+                    score_file = f"combined_results_with_scores_{eval_select}.csv"
+                    st.success("Scoring completed and results saved to " + score_file)
+                    csv_download(f"Download {score_file}", results, score_file)
 
-                if eval_select == "Nemotron":
-                    st.write("evaluating with " + eval_select)
-                    st.write("Evaluations will be done using: nemotron-4-340b-reward")
-                    SCORE_FILE = "combined_results_with_scores_nemotron.csv"
-                    score_response = requests.post(
-                        f"{BACKEND_URL}/evaluation/run-scoring/",
-                        json={"combined_results": combined_results}, 
-                        stream=True
-                    )
-                elif eval_select == "RAGAS":
-                    st.write("evaluating with " + eval_select)
-                    st.write("Evaluations will be done using: Llama3-70b-instruct LLM and nv-embed-v1 embedding model")
-                    SCORE_FILE = "combined_results_with_scores_RAGAS.csv"
-                    score_response = requests.post(
-                        f"{BACKEND_URL}/evaluation/run-scoring-RAGAS/",
-                        json={"combined_results": combined_results}, 
-                        stream=True
-                    )
-                elif eval_select == "LLM-AS-A-JUDGE":
-                    st.write("evaluating with " + eval_select)
-                    st.write("llama3-70b-instruct will be used as Judge")
-                    SCORE_FILE = "combined_results_with_scores_LLM-AS-A-JUDGE.csv"
-                    score_response = requests.post(
-                        f"{BACKEND_URL}/evaluation/run-scoring_llm_as_a_judge/",
-                        json={"combined_results": combined_results}, 
-                        stream=True
-                    )
-                if score_response.status_code == 200:
-                    for index,line in enumerate(score_response.iter_lines()):
-                        if line:
-                            try:
-                                result = json.loads(line.decode('utf-8'))
-                                if 'question' in result and 'gt_answer' in result:
-                                    results.append(result)
-                                    # Update the displayed DataFrame incrementally
-                                    results_df = pd.DataFrame(results)
-                                    score_placeholder.dataframe(results_df)
-                                    progress_bar.progress(min((index + 1) / total_items, 1.0))  # Update progress
-                                else:
-                                    st.error("Received data in an unexpected format.")
-                                    st.write(result)  # For debugging purposes
-                            except json.JSONDecodeError:
-                                st.error("Error decoding JSON response.")
-                    # Success message displayed after processing all lines
-                    st.success("Scoring completed and results saved to " + SCORE_FILE)
-                    # Save the final results to a CSV file
-                    COMBINED_RESULTS_PATH_WITH_SCORES=os.path.join(DATA_DIR, SCORE_FILE)
-                    pd.DataFrame(results).to_csv(COMBINED_RESULTS_PATH_WITH_SCORES, index=False)
-                    progress_bar.progress(100)
-                else:
-                    st.error("Error running scoring.")
-                    progress_bar.progress(0)
 
-if __name__ == "__main__":
-    app()
+app()

@@ -13,92 +13,83 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-import os
-import streamlit as st
-import requests
 import time
-from dotenv import load_dotenv
-load_dotenv()
 
-BACKEND_URL = os.getenv("BACKEND_URL")
+import streamlit as st
+
+from common import api, error_detail, model_selector, require_api_key
+
+st.set_page_config(page_title="Knowledge Graph RAG")
+require_api_key()
 
 st.title("Knowledge Graph RAG")
-st.subheader("Load Data from Files")
+llm = model_selector("ui")
 
 
-if 'documents' not in st.session_state:
-    st.session_state['documents'] = None
-
-# Fetch available models from the backend
-response = requests.get(f"{BACKEND_URL}/ui/get-models/")
-if response.status_code == 200:
-    available_models = response.json()["models"]
-else:
-    st.error("Error fetching models.")
-    available_models = []
-
-with st.sidebar:
-    llm = st.selectbox("Choose an LLM", available_models, index=available_models.index("mistralai/mixtral-8x7b-instruct-v0.1") if "mistralai/mixtral-8x7b-instruct-v0.1" in available_models else 0)
-    st.write("You selected: ", llm)
-
-def has_pdf_files(directory):
-    for file in os.listdir(directory):
-        if file.endswith(".pdf"):
-            return True
-    return False
-
-def app():
-    ### mitesh: put absolute path.
-    cwd = os.path.abspath('../backend/')#os.getcwd()
-    directories = [d for d in os.listdir(cwd) if os.path.isdir(os.path.join(cwd, d)) and not d.startswith('.') and '__' not in d]
-    selected_dir = st.selectbox("Select a directory:", directories, index=0)
-    directory = os.path.join(cwd, selected_dir)
- 
-    if st.button("Process Documents"):
-        res = has_pdf_files(directory)
-        if not res:
-            st.error("No PDF files found in directory! Only PDF files and text extraction are supported for now.")
-            st.stop()
-        
-        response = requests.post(f"{BACKEND_URL}/ui/process-documents/", json={"directory": directory, "model_id": llm})
-        if response.status_code == 200:
-            progress_bar = st.progress(0)
-            progress_text = st.empty()
-
-            while True:
-                progress_response = requests.get(f"{BACKEND_URL}/ui/progress/")
-                if progress_response.status_code == 200:
-                    try:
-                        progress_data = progress_response.json()
-                        progress = float(progress_data.get("progress", 0))  # Default to 0 if not found
-                        progress_bar.progress(progress)
-                        progress_text.text(f"Processing: {int(progress * 100)}%")
-                        if progress >= 1.0:
-                            break
-                    except (ValueError, KeyError):
-                        st.error("Received invalid progress data.")
-                        break
-                else:
-                    st.error("Error fetching progress data.")
-                    break
-                time.sleep(1)
-        # Check for the file existence
-            while True:
-                file_check_response = requests.get(f"{BACKEND_URL}/ui/check-file-exists/")
-                if file_check_response.status_code == 200:
-                    file_check_data = file_check_response.json()
-                    if file_check_data.get("file_exists", False):
-                        st.success("Processing complete and graph created.")
-                        break
-                else:
-                    st.error("Error checking file existence.")
-                    break
-                time.sleep(1)
-
-
-            st.success("Saved to knowledge_graph.graphml")
+def upload_section():
+    st.subheader("1. Upload PDFs")
+    files = st.file_uploader("PDF files", type=["pdf"], accept_multiple_files=True)
+    if files and st.button("Upload"):
+        resp = api("POST", "/documents/",
+                   files=[("files", (f.name, f.getvalue(), "application/pdf")) for f in files])
+        if resp.ok:
+            st.success(f"Uploaded: {', '.join(resp.json()['uploaded'])}")
         else:
-            st.error("Error processing documents.")
+            st.error(error_detail(resp))
 
-if __name__ == "__main__":
-    app()
+    resp = api("GET", "/documents/")
+    documents = resp.json()["documents"] if resp.ok else []
+    if not documents:
+        st.caption("No documents in your workspace yet.")
+    for doc in documents:
+        col_name, col_size, col_delete = st.columns([6, 2, 1])
+        col_name.write(doc["name"])
+        col_size.write(f"{doc['size_kb']} KB")
+        if col_delete.button("✕", key=f"delete-{doc['name']}", help="Delete"):
+            api("DELETE", f"/documents/{doc['name']}")
+            st.rerun()
+    return documents
+
+
+def show_progress():
+    """Poll the backend until the current processing job finishes."""
+    progress_bar = st.progress(0.0)
+    progress_text = st.empty()
+    while True:
+        resp = api("GET", "/ui/progress/")
+        if not resp.ok:
+            st.error(error_detail(resp))
+            return
+        status = resp.json()
+        progress_bar.progress(min(float(status.get("progress", 0)), 1.0))
+        progress_text.text(status.get("message", ""))
+        if status["state"] == "done":
+            st.success(status["message"] + " Saved as knowledge_graph.graphml (see the visualization page).")
+            return
+        if status["state"] == "error":
+            st.error(f"Processing failed: {status['message']}")
+            return
+        if status["state"] == "idle":
+            return
+        time.sleep(2)
+
+
+def process_section(documents):
+    st.subheader("2. Build the knowledge graph")
+    st.caption("Extracts entity/relation triples from every chunk with the selected LLM and indexes "
+               "the chunks for hybrid search. Large PDFs can take a while.")
+    if st.button("Process Documents", disabled=not documents):
+        resp = api("POST", "/ui/process-documents/", json={"model_id": llm})
+        if not resp.ok:
+            st.error(error_detail(resp))
+            return
+        show_progress()
+    else:
+        status = api("GET", "/ui/progress/")
+        # e.g. the page was reloaded while a job was running
+        if status.ok and status.json().get("state") == "running":
+            show_progress()
+
+
+documents = upload_section()
+process_section(documents)

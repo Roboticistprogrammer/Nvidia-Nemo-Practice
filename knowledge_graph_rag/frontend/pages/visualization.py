@@ -16,18 +16,27 @@
 import streamlit as st
 import streamlit.components.v1 as components
 
+from common import api, require_api_key
+
 st.set_page_config(layout="wide")
+require_api_key()
+
 
 def app():
     st.title("Visualize the Knowledge Graph!")
-    st.subheader("Load a knowledge graph GraphML file from your system.")
-    st.write("If you used the previous step, it will be saved on your system as ```knowledge_graph.graphml```")
-    
+    resp = api("GET", "/ui/graph/")
+    if resp.ok:
+        st.download_button("Download knowledge_graph.graphml", resp.content,
+                           file_name="knowledge_graph.graphml", mime="application/xml")
+        st.write("Then open the file in Gephi Lite below (File → Open → Local file).")
+    else:
+        st.info("No knowledge graph yet. Upload and process your PDFs on the main page first.")
+
     components.iframe(
         src="https://gephi.org/gephi-lite/",
         height=800,
         scrolling=True,
     )
 
-if __name__ == "__main__":
-    app()
+
+app()

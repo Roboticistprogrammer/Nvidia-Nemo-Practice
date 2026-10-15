@@ -13,19 +13,14 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-import streamlit as st
-import requests
-import json
 import time
-import os
 
-from dotenv import load_dotenv
-load_dotenv()
+import streamlit as st
 
-# Get the backend URL from environment variables
-BACKEND_URL = os.getenv("BACKEND_URL")
+from common import api, error_detail, model_selector, require_api_key
 
 st.set_page_config(layout="wide")
+require_api_key()
 
 st.title("Chat with your Knowledge Graph!")
 
@@ -35,18 +30,8 @@ if "messages" not in st.session_state:
 for message in st.session_state.messages:
     with st.chat_message(message["role"]):
         st.markdown(message["content"])
-# Fetch available models from the backend
-response = requests.get(f"{BACKEND_URL}/chat/get-models/")
-if response.status_code == 200:
-    available_models = response.json()["models"]
-else:
-    st.error("Error fetching models.")
-    available_models = []
 
-with st.sidebar:
-    llm = st.selectbox("Choose an LLM", available_models, index=available_models.index("mistralai/mixtral-8x7b-instruct-v0.1") if "mistralai/mixtral-8x7b-instruct-v0.1" in available_models else 0)
-    st.write("You selected: ", llm)
-
+llm = model_selector("chat")
 with st.sidebar:
     use_kg = st.checkbox("Use knowledge graph")
 
@@ -60,21 +45,21 @@ if user_input:
     with st.chat_message("assistant"):
         message_placeholder = st.empty()
         full_response = ""
-        
+
         # Send the user input to the backend for processing
-        response = requests.post(f"{BACKEND_URL}/chat/chat/", json={"user_input": user_input, "use_kg": use_kg, "model_id": llm})
-        if response.status_code == 200:
-            response_data = response.json()
-            context = response_data.get("context", "")
-            assistant_response = response_data.get("assistant_response", "")
+        with st.spinner("Thinking..."):
+            response = api("POST", "/chat/chat/", json={"user_input": user_input, "use_kg": use_kg, "model_id": llm})
+        if response.ok:
+            assistant_response = response.json().get("assistant_response", "")
             if "knowledge graph is currently unavailable" in assistant_response:
-                st.error("The knowledge graph is currently unavailable. Please try again later.")
+                st.error("No knowledge graph yet. Upload and process your PDFs on the main page first.")
             else:
                 for chunk in assistant_response.split(' '):
                     full_response += chunk + ' '
                     message_placeholder.markdown(full_response)
-                    time.sleep(0.05)  #
+                    time.sleep(0.05)
         else:
-            st.error("Error processing the chat request.")
+            st.error(f"Error processing the chat request: {error_detail(response)}")
 
-    st.session_state.messages.append({"role": "assistant", "content": full_response})
+    if full_response:
+        st.session_state.messages.append({"role": "assistant", "content": full_response})
