@@ -1,0 +1,4 @@
+# Local development: everything in one virtualenv (Python 3.10).
+# Docker images install backend/ and frontend/ requirements separately.
+-r backend/requirements.txt
+-r frontend/requirements.txt

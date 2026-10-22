@@ -1,0 +1,7 @@
+[server]
+headless = true
+# keep in sync with the backend's MAX_UPLOAD_MB
+maxUploadSize = 50
+
+[browser]
+gatherUsageStats = false

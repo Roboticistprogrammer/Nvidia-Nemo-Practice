@@ -1,0 +1,9 @@
+
+volumes/
+**/.ipynb_checkpoints
+# **/data
+**/dask-worker-space
+
+# user uploads, workspaces and generated graphs
+backend/data/
+progress.txt

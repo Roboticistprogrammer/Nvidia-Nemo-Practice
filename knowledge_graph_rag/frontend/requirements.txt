@@ -1,0 +1,6 @@
+# Frontend (Streamlit) dependencies
+numpy==1.24.1
+pandas==2.2.2
+python-dotenv==1.2.4
+Requests==2.31.0
+streamlit==1.30.0

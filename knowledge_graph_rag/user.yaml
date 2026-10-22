@@ -1,0 +1,2 @@
+proxy:
+  healthCheckTimeout: 1000 # ms, the interval that to do component healthy check
